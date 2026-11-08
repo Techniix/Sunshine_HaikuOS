@@ -74,7 +74,34 @@ fi
 
 if [ "${INSTALL_DEPS}" = "1" ]; then
   log "Installing build dependencies"
-  pkgman install -y "${DEPS[@]}"
+
+  # Check that pkgman can reach its repositories before asking it to resolve anything: when it
+  # can't, it silently falls back to stale cached data and reports packages as "not found".
+  PKGMAN=(pkgman)
+  if ! pkgman refresh; then
+    # The usual cause is a Haiku build whose Network Kit lacks HTTPS support (the "openssl" build
+    # feature), which pkgman reports as "Operation not supported". curl has its own OpenSSL, so
+    # if curl can reach the repository server, run pkgman through a local curl relay instead.
+    if command -v curl >/dev/null && command -v python3 >/dev/null \
+      && curl -sSfL -o /dev/null https://eu.hpkg.haiku-os.org/haikuports/master/x86_64/current/repo.sha256; then
+      echo "pkgman can't reach its repositories, but curl can; using the curl relay" \
+        "(packaging/haiku/tools/pkgman-curl-relay.py)."
+      PKGMAN=(python3 "${ROOT}/packaging/haiku/tools/pkgman-curl-relay.py")
+      "${PKGMAN[@]}" refresh
+    else
+      cat >&2 <<'EOF'
+pkgman can't reach its package repositories.
+- "Operation not supported" means this Haiku build's Network Kit has no HTTPS support. Haiku
+  builds made without an @nightly/@release profile need `HAIKU_BUILD_FEATURE_SSL = 1 ;` in
+  build/jam/UserBuildConfig. Until then, packaging/haiku/tools/pkgman-curl-relay.py runs pkgman
+  through curl (it needs curl and python3).
+- Otherwise, check the network connection and the system clock.
+EOF
+      exit 1
+    fi
+  fi
+
+  "${PKGMAN[@]}" install -y "${DEPS[@]}"
 fi
 
 # ---------------------------------------------------------------------------------------------

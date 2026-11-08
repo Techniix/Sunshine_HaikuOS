@@ -65,6 +65,15 @@ the audio routing.
 
 ## Troubleshooting
 
+**pkgman reports "Operation not supported" for every repository.** The Network Kit of this Haiku
+build has no HTTPS support, which happens with self-built systems made without an `@nightly` or
+`@release` profile. Add `HAIKU_BUILD_FEATURE_SSL = 1 ;` to `build/jam/UserBuildConfig` and rebuild.
+Until then, `build.sh --install-deps` detects the problem and runs pkgman through
+`packaging/haiku/tools/pkgman-curl-relay.py`, which fetches the repository files with curl through
+a relay on 127.0.0.1. The relay changes each repository's download address only while pkgman runs,
+and pkgman still checks every checksum. It also works on its own, e.g.
+`python3 packaging/haiku/tools/pkgman-curl-relay.py install -y <package>`.
+
 **Moonlight does not find the computer.** Add it by IP address in Moonlight. Discovery needs UDP
 port 5353 to be free for sharing; Sunshine coexists with HaikuPorts' `mdnsd`.
 
