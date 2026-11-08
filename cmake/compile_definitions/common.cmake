@@ -62,6 +62,8 @@ elseif(UNIX)
 
     if(APPLE)
         include(${CMAKE_MODULE_PATH}/compile_definitions/macos.cmake)
+    elseif(HAIKU)
+        include(${CMAKE_MODULE_PATH}/compile_definitions/haiku.cmake)
     else()
         include(${CMAKE_MODULE_PATH}/compile_definitions/linux.cmake)
     endif()

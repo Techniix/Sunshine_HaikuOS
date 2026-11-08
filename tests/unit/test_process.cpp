@@ -15,7 +15,7 @@
 #include <thread>
 
 // lib includes
-#include <boost/process/v1.hpp>
+#include "src/boost_process_compat.h"  // Boost.Process with Sunshine's platform fixes
 
 #ifdef _WIN32
   // lib includes

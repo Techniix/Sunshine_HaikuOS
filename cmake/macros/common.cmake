@@ -9,6 +9,8 @@ elseif(UNIX)
 
     if(APPLE)
         include(${CMAKE_MODULE_PATH}/macros/macos.cmake)
+    elseif(HAIKU)
+        include(${CMAKE_MODULE_PATH}/macros/haiku.cmake)
     else()
         include(${CMAKE_MODULE_PATH}/macros/linux.cmake)
     endif()

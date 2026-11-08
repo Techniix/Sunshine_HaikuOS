@@ -1,0 +1,11 @@
+{
+  "env": {
+    "PATH": "$(PATH):$(HOME)/config/non-packaged/bin"
+  },
+  "apps": [
+    {
+      "name": "Desktop",
+      "image-path": "desktop.png"
+    }
+  ]
+}

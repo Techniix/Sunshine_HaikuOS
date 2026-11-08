@@ -1,0 +1,19 @@
+diff --git a/cmake/ffmpeg/ffmpeg.cmake b/cmake/ffmpeg/ffmpeg.cmake
+index 52a5edb..ae6a626 100644
+--- a/cmake/ffmpeg/ffmpeg.cmake
++++ b/cmake/ffmpeg/ffmpeg.cmake
+@@ -210,6 +210,14 @@ if(CMAKE_CROSSCOMPILING)
+     endif()
+ endif()
+ 
++# Platform ports (e.g. Haiku) can link FFmpeg against codec libraries that the
++# system package manager provides, instead of building them here.
++set(FFMPEG_EXTRA_CONFIGURE_FLAGS "" CACHE STRING "Additional flags passed to FFmpeg's configure script")
++if(FFMPEG_EXTRA_CONFIGURE_FLAGS)
++    separate_arguments(_ffmpeg_user_configure_flags UNIX_COMMAND "${FFMPEG_EXTRA_CONFIGURE_FLAGS}")
++    list(APPEND FFMPEG_EXTRA_CONFIGURE ${_ffmpeg_user_configure_flags})
++endif()
++
+ # convert list to string
+ # configure command will only take the first argument if not converted to string
+ string(REPLACE ";" " " FFMPEG_EXTRA_CONFIGURE "${FFMPEG_EXTRA_CONFIGURE}")

@@ -11,6 +11,9 @@ if(NOT DEFINED FFMPEG_PREPARED_BINARIES)
     elseif(FREEBSD)
         # numa is not available on FreeBSD
         set(FFMPEG_PLATFORM_LIBRARIES va va-drm va-x11 X11)
+    elseif(HAIKU)
+        # Haiku has no VA-API, X11 or numa. FFmpeg loads libvulkan at runtime, so nothing extra is linked.
+        set(FFMPEG_PLATFORM_LIBRARIES "")
     elseif(UNIX AND NOT APPLE)
         set(FFMPEG_PLATFORM_LIBRARIES numa va va-drm va-x11 X11)
     endif()
@@ -145,6 +148,8 @@ else()
             set(FFMPEG_PLATFORM_LIBRARIES mfplat ole32 strmiids mfuuid vpl)
         elseif(FREEBSD)
             set(FFMPEG_PLATFORM_LIBRARIES va va-drm va-x11 X11)
+        elseif(HAIKU)
+            set(FFMPEG_PLATFORM_LIBRARIES "")
         elseif(UNIX AND NOT APPLE)
             set(FFMPEG_PLATFORM_LIBRARIES numa va va-drm va-x11 X11)
         endif()
@@ -240,7 +245,8 @@ endif()
 
 set(FFMPEG_INCLUDE_DIRS "${FFMPEG_PREPARED_BINARIES}/include")
 
-if(UNIX AND NOT APPLE)
+# Haiku has no VA-API, so its FFmpeg package never links libva.
+if(UNIX AND NOT APPLE AND NOT HAIKU)
     find_package(Libva REQUIRED)
 
     # Static FFmpeg metadata can pull bundled libva archives back into the link.

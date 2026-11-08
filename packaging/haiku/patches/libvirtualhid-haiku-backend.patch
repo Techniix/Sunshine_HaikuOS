@@ -1,0 +1,2173 @@
+From b3489f3b2e2c645606e6bcb4d7b23c5f0bc00cca Mon Sep 17 00:00:00 2001
+From: Dalton Singleton <blumoon94@gmail.com>
+Date: Sun, 8 Nov 2026 01:47:35 -0500
+Subject: [PATCH] Add a Haiku keyboard and mouse backend
+
+Haiku only accepts input events from input_server device add-ons, so the
+backend forwards keyboard, text and mouse events over a named kernel port
+to a small add-on (virtualhid_input) that enqueues them like a physical
+keyboard and mouse. The user's keymap (including dead keys), lock keys,
+mouse and click settings apply.
+
+- haiku_backend.cpp: Backend implementation for keyboards and mice; only
+  uses kernel ports, so the library itself needs no Haiku kit library
+- haiku_keycodes.cpp: Windows virtual-key to Haiku key code table, derived
+  from Haiku's HID keyboard driver
+- haiku_input_protocol.hpp: versioned fixed-size event protocol shared with
+  the add-on; the add-on validates every message against its size
+- input_server/: the add-on (option LIBVIRTUALHID_BUILD_HAIKU_INPUT_ADDON).
+  It merges bursts of relative motion and spaces pointer events so
+  input_server applies each to the current cursor position, and releases
+  held keys and buttons separately when a keyboard or mouse closes.
+
+Gamepads, touch and pen tablets report as not implemented.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVRp8ng9nS5QfEBXkdYrMQ
+---
+ CMakeLists.txt                                |    1 +
+ src/CMakeLists.txt                            |   14 +
+ src/platform/haiku/haiku_backend.cpp          |  405 ++++++
+ src/platform/haiku/haiku_input_protocol.hpp   |   98 ++
+ src/platform/haiku/haiku_keycodes.cpp         |  166 +++
+ src/platform/haiku/haiku_keycodes.hpp         |   25 +
+ .../input_server/VirtualHidInputDevice.cpp    | 1181 +++++++++++++++++
+ .../input_server/VirtualHidInputDevice.h      |  119 ++
+ src/platform/haiku/input_server/addon.cmake   |   45 +
+ 9 files changed, 2054 insertions(+)
+ create mode 100644 src/platform/haiku/haiku_backend.cpp
+ create mode 100644 src/platform/haiku/haiku_input_protocol.hpp
+ create mode 100644 src/platform/haiku/haiku_keycodes.cpp
+ create mode 100644 src/platform/haiku/haiku_keycodes.hpp
+ create mode 100644 src/platform/haiku/input_server/VirtualHidInputDevice.cpp
+ create mode 100644 src/platform/haiku/input_server/VirtualHidInputDevice.h
+ create mode 100644 src/platform/haiku/input_server/addon.cmake
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 945b0d5..5301830 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -41,6 +41,7 @@ option(LIBVIRTUALHID_TOOLS_STATIC_RUNTIME "Link libvirtualhid tools to static co
+ option(LIBVIRTUALHID_TOOLS_FULLY_STATIC "Attempt to link libvirtualhid tools as fully static binaries" OFF)
+ option(LIBVIRTUALHID_TOOLS_STATIC_SDL3 "Prefer a static SDL3 diagnostic UI dependency when available" ON)
+ option(LIBVIRTUALHID_ENABLE_XTEST "Enable X11/XTest keyboard and mouse fallback on evdev platforms" ON)
++option(LIBVIRTUALHID_BUILD_HAIKU_INPUT_ADDON "Build the Haiku input_server add-on that delivers keyboard and mouse input" ON)
+ option(LIBVIRTUALHID_BUILD_WINDOWS_DRIVER "Build the Windows UMDF2 driver package with the WDK/MSVC toolchain" OFF)
+ option(LIBVIRTUALHID_BUILD_WINDOWS_BROKER
+        "Build the Windows broker service used by the monetized UMDF driver package"
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 97c96c3..dee8b0d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -104,6 +104,16 @@ function(libvirtualhid_add_library target_name)
+           "-framework Carbon"
+           "-framework CoreFoundation"
+           "-framework IOKit")
++    elseif(HAIKU)
++        # Keyboard and mouse go through the virtualhid_input input_server add-on.
++        target_sources(${target_name}
++          PRIVATE
++          "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/license_unavailable.cpp"
++          "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/haiku/haiku_backend.cpp"
++          "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/haiku/haiku_keycodes.cpp")
++        # Only kernel ports (libroot) are used, so the library needs no Haiku kit libraries.
++        # Port message codes are four-character constants.
++        target_compile_options(${target_name} PRIVATE -Wno-multichar)
+     else()
+         target_sources(${target_name}
+           PRIVATE
+@@ -128,6 +138,10 @@ function(libvirtualhid_add_library target_name)
+ endfunction()
+ 
+ libvirtualhid_add_library(${PROJECT_NAME})
++
++if(HAIKU AND LIBVIRTUALHID_BUILD_HAIKU_INPUT_ADDON)
++    include("${CMAKE_CURRENT_SOURCE_DIR}/platform/haiku/input_server/addon.cmake")
++endif()
+ add_library(libvirtualhid::libvirtualhid ALIAS ${PROJECT_NAME})
+ set_target_properties(${PROJECT_NAME} PROPERTIES
+   EXPORT_NAME libvirtualhid
+diff --git a/src/platform/haiku/haiku_backend.cpp b/src/platform/haiku/haiku_backend.cpp
+new file mode 100644
+index 0000000..61afa0f
+--- /dev/null
++++ b/src/platform/haiku/haiku_backend.cpp
+@@ -0,0 +1,405 @@
++/**
++ * @file src/platform/haiku/haiku_backend.cpp
++ * @brief Haiku keyboard and mouse backend.
++ *
++ * Haiku delivers input through input_server, which only accepts events from its own device
++ * add-ons. This backend therefore forwards keyboard and mouse events to the `virtualhid_input`
++ * add-on (see input_server/VirtualHidInputDevice.cpp) over a named kernel port. The add-on turns
++ * them into the same messages a physical keyboard or mouse produces, so every Haiku application
++ * receives ordinary input, and the user's keymap, mouse and click settings all apply.
++ *
++ * Gamepads, touchscreens, trackpads and pen tablets are not available yet: Haiku has no virtual
++ * joystick device, and touch input is not part of input_server's public event model.
++ */
++
++// standard includes
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++
++// platform includes
++#include <OS.h>
++
++// local includes
++#include "core/backend.hpp"
++#include "haiku_input_protocol.hpp"
++#include "haiku_keycodes.hpp"
++
++namespace lvh::detail {
++  namespace haiku {
++    namespace proto = lvh::haiku_protocol;
++
++    /** Longest time an ordinary submission waits for room in the add-on's queue. */
++    constexpr bigtime_t SEND_TIMEOUT = 50000;
++
++    /**
++     * Longest time a release or reset waits. Dropping one of these would leave a key or button
++     * stuck down, so they are allowed to wait for the add-on considerably longer.
++     */
++    constexpr bigtime_t RELEASE_TIMEOUT = 500000;
++
++    /** Windows-style high-resolution wheel units per detent, as used by the public API. */
++    constexpr float WHEEL_DELTA = 120.0F;
++
++    constexpr const char *ADDON_MISSING_MESSAGE =
++      "The libvirtualhid input_server add-on is not running. Install virtualhid_input to "
++      "~/config/non-packaged/add-ons/input_server/devices/ and restart input_server "
++      "(or reboot).";
++
++    /**
++     * @brief Build a protocol event.
++     */
++    proto::event_t make_event(proto::event_type_e type, int32 a = 0, int32 b = 0, float x = 0.0F, float y = 0.0F) {
++      return proto::event_t {static_cast<uint32>(type), a, b, x, y};
++    }
++
++    /**
++     * @brief Connection to the add-on port, shared by every device of one backend.
++     */
++    class AddOnConnection {
++    public:
++      /**
++       * @brief Send one event, optionally followed by a payload, to the add-on.
++       *
++       * @param event Event header.
++       * @param payload Optional payload bytes (TEXT only).
++       * @param payload_size Payload length.
++       * @param timeout Longest time to wait for room in the queue.
++       * @return Operation status.
++       */
++      OperationStatus send(const proto::event_t &event, const char *payload = nullptr, std::size_t payload_size = 0, bigtime_t timeout = SEND_TIMEOUT) {
++        std::vector<char> buffer(sizeof(event) + payload_size);
++        std::memcpy(buffer.data(), &event, sizeof(event));
++        if (payload_size > 0) {
++          std::memcpy(buffer.data() + sizeof(event), payload, payload_size);
++        }
++
++        // The add-on recreates its port whenever input_server restarts, so retry once with a
++        // freshly resolved port before giving up. Only the port lookup is serialized; writes run
++        // concurrently (kernel ports are thread-safe), so one slow write never holds up others.
++        for (int attempt = 0; attempt < 2; attempt++) {
++          const port_id port = resolve();
++          if (port < 0) {
++            return OperationStatus::failure(ErrorCode::backend_unavailable, ADDON_MISSING_MESSAGE);
++          }
++
++          const status_t status = write_port_etc(port, proto::PROTOCOL_V1, buffer.data(), buffer.size(), B_RELATIVE_TIMEOUT, timeout);
++          if (status == B_OK) {
++            return OperationStatus::success();
++          }
++          if (status == B_TIMED_OUT || status == B_WOULD_BLOCK) {
++            return OperationStatus::failure(ErrorCode::backend_failure, "Haiku input add-on queue is full");
++          }
++
++          forget(port);  // port vanished (B_BAD_PORT_ID); resolve again
++        }
++
++        return OperationStatus::failure(ErrorCode::backend_unavailable, ADDON_MISSING_MESSAGE);
++      }
++
++    private:
++      port_id resolve() {
++        std::lock_guard lock {mutex_};
++        if (port_ >= 0) {
++          port_info info;
++          if (get_port_info(port_, &info) == B_OK) {
++            return port_;
++          }
++          port_ = -1;
++        }
++        port_ = find_port(proto::PORT_NAME);
++        return port_;
++      }
++
++      void forget(port_id port) {
++        std::lock_guard lock {mutex_};
++        if (port_ == port) {
++          port_ = -1;
++        }
++      }
++
++      std::mutex mutex_;
++      port_id port_ = -1;
++    };
++
++    /**
++     * @brief Device node reported for diagnostics.
++     *
++     * @return Node describing the add-on port.
++     */
++    std::vector<DeviceNode> addon_nodes() {
++      return {DeviceNode {DeviceNodeKind::other, std::string {"port:"} + proto::PORT_NAME}};
++    }
++
++    /**
++     * @brief Length of the longest prefix of `text` that fits `limit` bytes without splitting a
++     * UTF-8 sequence.
++     */
++    std::size_t utf8_prefix(const std::string &text, std::size_t offset, std::size_t limit) {
++      std::size_t length = std::min(limit, text.size() - offset);
++      if (offset + length == text.size()) {
++        return length;
++      }
++      // Step back over continuation bytes so the next chunk starts on a lead byte.
++      while (length > 0 && (static_cast<unsigned char>(text[offset + length]) & 0xC0) == 0x80) {
++        length--;
++      }
++      return length > 0 ? length : std::min(limit, text.size() - offset);
++    }
++
++    /**
++     * @brief Haiku virtual keyboard.
++     */
++    class HaikuKeyboard final: public BackendKeyboard {
++    public:
++      explicit HaikuKeyboard(std::shared_ptr<AddOnConnection> connection):
++          connection_ {std::move(connection)} {}
++
++      ~HaikuKeyboard() override {
++        static_cast<void>(close());
++      }
++
++      OperationStatus submit(const KeyboardEvent &event) override {
++        if (!open_) {
++          return OperationStatus::failure(ErrorCode::device_closed, "Haiku keyboard is closed");
++        }
++
++        const auto key = haiku_key_from_vk(event.key_code, event.extended);
++        if (key == 0) {
++          return OperationStatus::success();  // no Haiku key at this position
++        }
++
++        return connection_->send(make_event(proto::KEY, static_cast<int32>(key), event.pressed ? 1 : 0), nullptr, 0, event.pressed ? SEND_TIMEOUT : RELEASE_TIMEOUT);
++      }
++
++      OperationStatus type_text(const KeyboardTextEvent &event) override {
++        if (!open_) {
++          return OperationStatus::failure(ErrorCode::device_closed, "Haiku keyboard is closed");
++        }
++
++        std::size_t offset = 0;
++        while (offset < event.text.size()) {
++          const auto length = utf8_prefix(event.text, offset, proto::MAX_TEXT_BYTES);
++          auto status = connection_->send(make_event(proto::TEXT, static_cast<int32>(length)), event.text.data() + offset, length);
++          if (!status.ok()) {
++            return status;
++          }
++          offset += length;
++        }
++        return OperationStatus::success();
++      }
++
++      std::vector<DeviceNode> device_nodes() const override {
++        return addon_nodes();
++      }
++
++      OperationStatus close() override {
++        if (!open_) {
++          return OperationStatus::success();
++        }
++        open_ = false;
++
++        // Release anything still held so a closed keyboard never leaves a key stuck down.
++        static_cast<void>(connection_->send(make_event(proto::RESET_KEYS), nullptr, 0, RELEASE_TIMEOUT));
++        return OperationStatus::success();
++      }
++
++    private:
++      std::shared_ptr<AddOnConnection> connection_;
++      bool open_ = true;
++    };
++
++    /**
++     * @brief Map a portable mouse button to Haiku's button bit.
++     *
++     * @param button Portable button.
++     * @return Haiku button mask bit.
++     */
++    int32 haiku_button(MouseButton button) {
++      switch (button) {
++        case MouseButton::left:
++          return proto::BUTTON_PRIMARY;
++        case MouseButton::right:
++          return proto::BUTTON_SECONDARY;
++        case MouseButton::middle:
++          return proto::BUTTON_TERTIARY;
++        case MouseButton::side:
++          return proto::BUTTON_4;
++        case MouseButton::extra:
++          return proto::BUTTON_5;
++      }
++      return 0;
++    }
++
++    /**
++     * @brief Haiku virtual mouse.
++     */
++    class HaikuMouse final: public BackendMouse {
++    public:
++      HaikuMouse(std::shared_ptr<AddOnConnection> connection, const PointerViewport &desktop, const PointerViewport &viewport):
++          connection_ {std::move(connection)},
++          desktop_ {desktop},
++          viewport_ {viewport} {}
++
++      ~HaikuMouse() override {
++        static_cast<void>(close());
++      }
++
++      OperationStatus submit(const MouseEvent &event) override {
++        if (!open_) {
++          return OperationStatus::failure(ErrorCode::device_closed, "Haiku mouse is closed");
++        }
++
++        switch (event.kind) {
++          case MouseEventKind::relative_motion:
++            if (event.x == 0 && event.y == 0) {
++              return OperationStatus::success();
++            }
++            return connection_->send(make_event(proto::MOVE_RELATIVE, event.x, event.y));
++          case MouseEventKind::absolute_motion:
++            return submit_absolute(event);
++          case MouseEventKind::button:
++            {
++              const auto button = haiku_button(event.button);
++              if (button == 0) {
++                return OperationStatus::failure(ErrorCode::invalid_argument, "unknown mouse button");
++              }
++              return connection_->send(make_event(proto::BUTTON, button, event.pressed ? 1 : 0), nullptr, 0, event.pressed ? SEND_TIMEOUT : RELEASE_TIMEOUT);
++            }
++          case MouseEventKind::vertical_scroll:
++            // Portable positive values scroll up (away from the user); Haiku's positive y
++            // scrolls down.
++            return submit_wheel(0.0F, -static_cast<float>(event.high_resolution_scroll) / WHEEL_DELTA);
++          case MouseEventKind::horizontal_scroll:
++            // Portable positive values scroll right, as does Haiku's positive x.
++            return submit_wheel(static_cast<float>(event.high_resolution_scroll) / WHEEL_DELTA, 0.0F);
++        }
++
++        return OperationStatus::failure(ErrorCode::invalid_argument, "unsupported Haiku mouse event kind");
++      }
++
++      std::vector<DeviceNode> device_nodes() const override {
++        return addon_nodes();
++      }
++
++      OperationStatus close() override {
++        if (!open_) {
++          return OperationStatus::success();
++        }
++        open_ = false;
++
++        static_cast<void>(connection_->send(make_event(proto::RESET_BUTTONS), nullptr, 0, RELEASE_TIMEOUT));
++        return OperationStatus::success();
++      }
++
++    private:
++      OperationStatus submit_absolute(const MouseEvent &event) {
++        if (event.width <= 0 || event.height <= 0) {
++          return OperationStatus::failure(ErrorCode::invalid_argument, "absolute mouse motion needs a coordinate space");
++        }
++
++        const float source_x = event.has_fractional_absolute_coordinates ? event.absolute_x : static_cast<float>(event.x);
++        const float source_y = event.has_fractional_absolute_coordinates ? event.absolute_y : static_cast<float>(event.y);
++
++        // Position inside the target viewport, 0..1.
++        float x = source_x / static_cast<float>(event.width);
++        float y = source_y / static_cast<float>(event.height);
++
++        // When the caller configured geometry, place the viewport inside the desktop. Haiku's
++        // input_server spans one screen, so the desktop rectangle is the whole pointer area.
++        if (desktop_.width > 0 && desktop_.height > 0 && viewport_.width > 0 && viewport_.height > 0) {
++          x = (static_cast<float>(viewport_.offset_x - desktop_.offset_x) + x * static_cast<float>(viewport_.width)) / static_cast<float>(desktop_.width);
++          y = (static_cast<float>(viewport_.offset_y - desktop_.offset_y) + y * static_cast<float>(viewport_.height)) / static_cast<float>(desktop_.height);
++        }
++
++        if (!std::isfinite(x) || !std::isfinite(y)) {
++          return OperationStatus::failure(ErrorCode::invalid_argument, "absolute mouse position is not finite");
++        }
++
++        return connection_->send(make_event(proto::MOVE_ABSOLUTE, 0, 0, std::clamp(x, 0.0F, 1.0F), std::clamp(y, 0.0F, 1.0F)));
++      }
++
++      OperationStatus submit_wheel(float dx, float dy) {
++        if (dx == 0.0F && dy == 0.0F) {
++          return OperationStatus::success();
++        }
++        return connection_->send(make_event(proto::WHEEL, 0, 0, dx, dy));
++      }
++
++      std::shared_ptr<AddOnConnection> connection_;
++      PointerViewport desktop_;
++      PointerViewport viewport_;
++      bool open_ = true;
++    };
++
++    /**
++     * @brief Haiku platform backend.
++     */
++    class HaikuBackend final: public Backend {
++    public:
++      HaikuBackend():
++          connection_ {std::make_shared<AddOnConnection>()} {
++        capabilities_.backend_name = "haiku-input-server-addon";
++        capabilities_.supports_keyboard = true;
++        capabilities_.supports_mouse = true;
++        // The add-on is free and ships with the library; it is not a licensed driver package.
++        capabilities_.requires_installed_driver = false;
++      }
++
++      const BackendCapabilities &capabilities() const override {
++        return capabilities_;
++      }
++
++      BackendGamepadCreationResult create_gamepad(DeviceId /*id*/, const CreateGamepadOptions & /*options*/) override {
++        return {OperationStatus::failure(ErrorCode::unsupported_profile, "Haiku virtual gamepads are not implemented yet"), nullptr};
++      }
++
++      BackendKeyboardCreationResult create_keyboard(DeviceId /*id*/, const CreateKeyboardOptions &options) override {
++        if (options.profile.device_type != DeviceType::keyboard) {
++          return {OperationStatus::failure(ErrorCode::unsupported_profile, "device profile is not a keyboard"), nullptr};
++        }
++        // Creation succeeds even before the add-on runs: every submission looks the port up
++        // again, so input starts working as soon as input_server loads the add-on, and the
++        // submission errors explain how to install it.
++        return {OperationStatus::success(), std::make_unique<HaikuKeyboard>(connection_)};
++      }
++
++      BackendMouseCreationResult create_mouse(DeviceId /*id*/, const CreateMouseOptions &options) override {
++        if (options.profile.device_type != DeviceType::mouse) {
++          return {OperationStatus::failure(ErrorCode::unsupported_profile, "device profile is not a mouse"), nullptr};
++        }
++        // Creation succeeds even before the add-on runs: every submission looks the port up
++        // again, so input starts working as soon as input_server loads the add-on, and the
++        // submission errors explain how to install it.
++        return {OperationStatus::success(), std::make_unique<HaikuMouse>(connection_, options.desktop, options.viewport)};
++      }
++
++      BackendTouchscreenCreationResult create_touchscreen(DeviceId /*id*/, const CreateTouchscreenOptions & /*options*/) override {
++        return {OperationStatus::failure(ErrorCode::unsupported_profile, "Haiku touchscreen backend is not implemented"), nullptr};
++      }
++
++      BackendTrackpadCreationResult create_trackpad(DeviceId /*id*/, const CreateTrackpadOptions & /*options*/) override {
++        return {OperationStatus::failure(ErrorCode::unsupported_profile, "Haiku trackpad backend is not implemented"), nullptr};
++      }
++
++      BackendPenTabletCreationResult create_pen_tablet(DeviceId /*id*/, const CreatePenTabletOptions & /*options*/) override {
++        return {OperationStatus::failure(ErrorCode::unsupported_profile, "Haiku pen tablet backend is not implemented"), nullptr};
++      }
++
++    private:
++      BackendCapabilities capabilities_;
++      std::shared_ptr<AddOnConnection> connection_;
++    };
++
++  }  // namespace haiku
++
++  std::unique_ptr<Backend> create_platform_backend() {
++    return std::make_unique<haiku::HaikuBackend>();
++  }
++
++}  // namespace lvh::detail
+diff --git a/src/platform/haiku/haiku_input_protocol.hpp b/src/platform/haiku/haiku_input_protocol.hpp
+new file mode 100644
+index 0000000..491b1f8
+--- /dev/null
++++ b/src/platform/haiku/haiku_input_protocol.hpp
+@@ -0,0 +1,98 @@
++/**
++ * @file src/platform/haiku/haiku_input_protocol.hpp
++ * @brief Wire protocol between the libvirtualhid Haiku backend and its input_server add-on.
++ *
++ * Haiku applications cannot inject input events directly; only input_server device add-ons can
++ * enqueue keyboard and mouse events. libvirtualhid therefore ships a small add-on
++ * (`virtualhid_input`, see input_server/) that creates a named kernel port and turns the events
++ * below into regular input events.
++ *
++ * Each port message is one fixed-size `event_t`, optionally followed by a payload (only TEXT has
++ * one). The port message code carries the protocol version, so an add-on and a library from
++ * different releases detect each other. The format is deliberately plain data: the add-on runs
++ * inside input_server, and every field can be validated against the received size before use.
++ * Newer protocol versions may only add event types; receivers ignore types they do not know.
++ *
++ * This header is shared by both sides and only depends on Haiku's basic type definitions.
++ */
++#pragma once
++
++// platform includes
++#include <SupportDefs.h>
++
++namespace lvh::haiku_protocol {
++
++  /**
++   * @brief Name of the port the add-on listens on.
++   */
++  constexpr const char *PORT_NAME = "libvirtualhid:input";
++
++  /**
++   * @brief Port message code for protocol version 1 ('LVH' followed by the version byte).
++   */
++  constexpr int32 PROTOCOL_V1 = 'LVH1';
++
++  /**
++   * @brief Number of queued messages the add-on port can hold.
++   */
++  constexpr int32 PORT_CAPACITY = 512;
++
++  /**
++   * @brief Largest TEXT payload in bytes.
++   */
++  constexpr int32 MAX_TEXT_BYTES = 4096;
++
++  /**
++   * @brief Event types.
++   */
++  enum event_type_e : uint32 {
++    /** Raw Haiku key code press or release. `a`: key code (0x01..0x7f), `b`: 1 down / 0 up. */
++    KEY = 1,
++
++    /** UTF-8 text. `a`: payload length in bytes; the payload follows the event, unterminated. */
++    TEXT = 2,
++
++    /** Relative pointer motion in screen pixels. `a`: dx, `b`: dy (positive moves down). */
++    MOVE_RELATIVE = 3,
++
++    /** Absolute pointer position normalized to the screen. `x`, `y`: 0.0 to 1.0. */
++    MOVE_ABSOLUTE = 4,
++
++    /** Mouse button press or release. `a`: button bit (BUTTON_*), `b`: 1 down / 0 up. */
++    BUTTON = 5,
++
++    /** Scroll wheel in Haiku units. `x`: horizontal (positive right), `y`: vertical (positive down). */
++    WHEEL = 6,
++
++    /** Release every key the add-on holds down (a keyboard was closed). */
++    RESET_KEYS = 7,
++
++    /** Release every mouse button the add-on holds down (a mouse was closed). */
++    RESET_BUTTONS = 8,
++  };
++
++  /**
++   * @brief Haiku mouse button bits (identical to B_MOUSE_BUTTON(n) in View.h).
++   */
++  enum button_e : int32 {
++    BUTTON_PRIMARY = 0x01,
++    BUTTON_SECONDARY = 0x02,
++    BUTTON_TERTIARY = 0x04,
++    BUTTON_4 = 0x08,
++    BUTTON_5 = 0x10,
++  };
++
++  /**
++   * @brief One input event as sent over the port.
++   */
++  struct event_t {
++    uint32 type;  ///< event_type_e
++    int32 a;  ///< First integer argument (see event_type_e).
++    int32 b;  ///< Second integer argument (see event_type_e).
++    float x;  ///< First float argument (see event_type_e).
++    float y;  ///< Second float argument (see event_type_e).
++  };
++
++  static_assert(sizeof(event_t) == 20, "event_t is part of the wire format");
++
++}  // namespace lvh::haiku_protocol
+diff --git a/src/platform/haiku/haiku_keycodes.cpp b/src/platform/haiku/haiku_keycodes.cpp
+new file mode 100644
+index 0000000..f736566
+--- /dev/null
++++ b/src/platform/haiku/haiku_keycodes.cpp
+@@ -0,0 +1,166 @@
++/**
++ * @file src/platform/haiku/haiku_keycodes.cpp
++ * @brief Translation from Windows virtual-key codes to Haiku key codes.
++ *
++ * The Haiku key codes come from Haiku's HID keyboard driver
++ * (src/add-ons/kernel/drivers/input/hid_shared/KeyboardProtocolHandler.cpp), which maps USB HID
++ * usages to the same codes a physical keyboard produces. Each entry below is the HID usage the
++ * virtual-key corresponds to, so local and streamed keyboards behave identically.
++ */
++
++// standard includes
++#include <array>
++
++// local includes
++#include "haiku_keycodes.hpp"
++
++namespace lvh::detail::haiku {
++  namespace {
++    /**
++     * @brief Build the 256-entry virtual-key to Haiku key code table at compile time.
++     */
++    constexpr std::array<std::uint8_t, 256> make_table() {
++      std::array<std::uint8_t, 256> t {};
++
++      t[0x08] = 0x1e;  // VK_BACK        -> Backspace
++      t[0x09] = 0x26;  // VK_TAB         -> Tab
++      t[0x0C] = 0x49;  // VK_CLEAR       -> Keypad 5 (Clear without Num Lock)
++      t[0x0D] = 0x47;  // VK_RETURN      -> Enter (keypad Enter when extended, see below)
++      t[0x10] = 0x4b;  // VK_SHIFT       -> Left Shift
++      t[0x11] = 0x5c;  // VK_CONTROL     -> Left Control (Right when extended)
++      t[0x12] = 0x5d;  // VK_MENU        -> Left Alt (Right when extended)
++      t[0x13] = 0x10;  // VK_PAUSE       -> Pause (B_PAUSE_KEY)
++      t[0x14] = 0x3b;  // VK_CAPITAL     -> Caps Lock (B_CAPS_LOCK_KEY)
++      t[0x1B] = 0x01;  // VK_ESCAPE      -> Esc
++      t[0x1C] = 0x6d;  // VK_CONVERT     -> Henkan (Japanese)
++      t[0x1D] = 0x6c;  // VK_NONCONVERT  -> Muhenkan (Japanese)
++      t[0x20] = 0x5e;  // VK_SPACE       -> Space
++      t[0x21] = 0x21;  // VK_PRIOR       -> Page Up
++      t[0x22] = 0x36;  // VK_NEXT        -> Page Down
++      t[0x23] = 0x35;  // VK_END         -> End
++      t[0x24] = 0x20;  // VK_HOME        -> Home
++      t[0x25] = 0x61;  // VK_LEFT        -> Left arrow
++      t[0x26] = 0x57;  // VK_UP          -> Up arrow
++      t[0x27] = 0x63;  // VK_RIGHT       -> Right arrow
++      t[0x28] = 0x62;  // VK_DOWN        -> Down arrow
++      t[0x2C] = 0x0e;  // VK_SNAPSHOT    -> Print Screen (B_PRINT_KEY)
++      t[0x2D] = 0x1f;  // VK_INSERT      -> Insert
++      t[0x2E] = 0x34;  // VK_DELETE      -> Delete
++
++      // Top-row digits: '1'..'9' are 0x12..0x1a, '0' is 0x1b.
++      t[0x30] = 0x1b;
++      for (int digit = 1; digit <= 9; digit++) {
++        t[0x30 + digit] = static_cast<std::uint8_t>(0x12 + digit - 1);
++      }
++
++      // Letters (VK 'A'..'Z').
++      constexpr std::uint8_t letters[26] = {
++        0x3c,  // A
++        0x50,  // B
++        0x4e,  // C
++        0x3e,  // D
++        0x29,  // E
++        0x3f,  // F
++        0x40,  // G
++        0x41,  // H
++        0x2e,  // I
++        0x42,  // J
++        0x43,  // K
++        0x44,  // L
++        0x52,  // M
++        0x51,  // N
++        0x2f,  // O
++        0x30,  // P
++        0x27,  // Q
++        0x2a,  // R
++        0x3d,  // S
++        0x2b,  // T
++        0x2d,  // U
++        0x4f,  // V
++        0x28,  // W
++        0x4d,  // X
++        0x2c,  // Y
++        0x4c,  // Z
++      };
++      for (int i = 0; i < 26; i++) {
++        t[0x41 + i] = letters[i];
++      }
++
++      t[0x5B] = 0x66;  // VK_LWIN        -> Left Windows (Option in the default keymap)
++      t[0x5C] = 0x67;  // VK_RWIN        -> Right Windows
++      t[0x5D] = 0x68;  // VK_APPS        -> Menu
++
++      t[0x60] = 0x64;  // VK_NUMPAD0
++      t[0x61] = 0x58;  // VK_NUMPAD1
++      t[0x62] = 0x59;  // VK_NUMPAD2
++      t[0x63] = 0x5a;  // VK_NUMPAD3
++      t[0x64] = 0x48;  // VK_NUMPAD4
++      t[0x65] = 0x49;  // VK_NUMPAD5
++      t[0x66] = 0x4a;  // VK_NUMPAD6
++      t[0x67] = 0x37;  // VK_NUMPAD7
++      t[0x68] = 0x38;  // VK_NUMPAD8
++      t[0x69] = 0x39;  // VK_NUMPAD9
++      t[0x6A] = 0x24;  // VK_MULTIPLY    -> Keypad *
++      t[0x6B] = 0x3a;  // VK_ADD         -> Keypad +
++      t[0x6C] = 0x65;  // VK_SEPARATOR   -> Keypad . (decimal separator position)
++      t[0x6D] = 0x25;  // VK_SUBTRACT    -> Keypad -
++      t[0x6E] = 0x65;  // VK_DECIMAL     -> Keypad .
++      t[0x6F] = 0x23;  // VK_DIVIDE      -> Keypad /
++
++      // F1..F12 are 0x02..0x0d. Haiku's HID driver leaves F13..F24 unmapped, so do we.
++      for (int f = 0; f < 12; f++) {
++        t[0x70 + f] = static_cast<std::uint8_t>(0x02 + f);
++      }
++
++      t[0x90] = 0x22;  // VK_NUMLOCK     -> Num Lock
++      t[0x91] = 0x0f;  // VK_SCROLL      -> Scroll Lock (B_SCROLL_KEY)
++      t[0x92] = 0x6a;  // VK_OEM_NEC_EQUAL -> Keypad = (B_NUMPAD_EQUAL_KEY)
++
++      t[0xA0] = 0x4b;  // VK_LSHIFT
++      t[0xA1] = 0x56;  // VK_RSHIFT
++      t[0xA2] = 0x5c;  // VK_LCONTROL
++      t[0xA3] = 0x60;  // VK_RCONTROL
++      t[0xA4] = 0x5d;  // VK_LMENU       -> Left Alt (Command in the default keymap)
++      t[0xA5] = 0x5f;  // VK_RMENU       -> Right Alt
++
++      t[0xBA] = 0x45;  // VK_OEM_1       -> ;
++      t[0xBB] = 0x1d;  // VK_OEM_PLUS    -> =
++      t[0xBC] = 0x53;  // VK_OEM_COMMA   -> ,
++      t[0xBD] = 0x1c;  // VK_OEM_MINUS   -> -
++      t[0xBE] = 0x54;  // VK_OEM_PERIOD  -> .
++      t[0xBF] = 0x55;  // VK_OEM_2       -> /
++      t[0xC0] = 0x11;  // VK_OEM_3       -> `
++      t[0xC1] = 0x6b;  // VK_ABNT_C1     -> Ro (International1, Brazilian/Japanese)
++      t[0xC2] = 0x70;  // VK_ABNT_C2     -> Brazilian keypad .
++      t[0xDB] = 0x31;  // VK_OEM_4       -> [
++      t[0xDC] = 0x33;  // VK_OEM_5       -> backslash
++      t[0xDD] = 0x32;  // VK_OEM_6       -> ]
++      t[0xDE] = 0x46;  // VK_OEM_7       -> '
++      t[0xE2] = 0x69;  // VK_OEM_102     -> < > (ISO extra key)
++
++      return t;
++    }
++
++    constexpr auto vk_table = make_table();
++  }  // namespace
++
++  std::uint32_t haiku_key_from_vk(std::uint16_t vk, bool extended) {
++    const auto code = static_cast<std::uint8_t>(vk & 0xFF);
++
++    if (extended) {
++      switch (code) {
++        case 0x0D:
++          return 0x5b;  // keypad Enter
++        case 0x11:
++          return 0x60;  // right Control
++        case 0x12:
++          return 0x5f;  // right Alt
++        default:
++          break;
++      }
++    }
++
++    return vk_table[code];
++  }
++
++}  // namespace lvh::detail::haiku
+diff --git a/src/platform/haiku/haiku_keycodes.hpp b/src/platform/haiku/haiku_keycodes.hpp
+new file mode 100644
+index 0000000..e74bf78
+--- /dev/null
++++ b/src/platform/haiku/haiku_keycodes.hpp
+@@ -0,0 +1,25 @@
++/**
++ * @file src/platform/haiku/haiku_keycodes.hpp
++ * @brief Translation from Windows virtual-key codes to Haiku key codes.
++ */
++#pragma once
++
++// standard includes
++#include <cstdint>
++
++namespace lvh::detail::haiku {
++
++  /**
++   * @brief Map a Windows virtual-key code to a Haiku key code.
++   *
++   * Haiku key codes name physical key positions (the BeOS layout); the active Haiku keymap turns
++   * them into characters, exactly as it does for a USB keyboard. libvirtualhid key codes are
++   * US-positional Windows virtual-key codes, so the mapping is positional too.
++   *
++   * @param vk Windows virtual-key code (only the low byte is used).
++   * @param extended Whether the client marked the key as extended (e.g. keypad Enter).
++   * @return Haiku key code, or 0 if the key has no Haiku equivalent.
++   */
++  std::uint32_t haiku_key_from_vk(std::uint16_t vk, bool extended);
++
++}  // namespace lvh::detail::haiku
+diff --git a/src/platform/haiku/input_server/VirtualHidInputDevice.cpp b/src/platform/haiku/input_server/VirtualHidInputDevice.cpp
+new file mode 100644
+index 0000000..b45cc46
+--- /dev/null
++++ b/src/platform/haiku/input_server/VirtualHidInputDevice.cpp
+@@ -0,0 +1,1181 @@
++/**
++ * @file src/platform/haiku/input_server/VirtualHidInputDevice.cpp
++ * @brief input_server device add-on that injects libvirtualhid keyboard and mouse input into Haiku.
++ *
++ * The event layout mirrors Haiku's own KeyboardInputDevice and MouseInputDevice add-ons
++ * (src/add-ons/input_server/devices/{keyboard,mouse} in the Haiku tree), so applications cannot
++ * tell these events apart from local hardware. Character and dead key lookup follows BKeymap from
++ * Haiku's src/kits/shared/Keymap.cpp (MIT licensed), reimplemented here on top of the public
++ * get_key_map() API because BKeymap itself is a private header.
++ *
++ * Everything received from the port is validated against its size before use: this code runs
++ * inside input_server, which must never crash because of a malformed message.
++ */
++
++// standard includes
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <initializer_list>
++#include <new>
++
++// platform includes
++#include <Autolock.h>
++#include <Message.h>
++#include <View.h>
++
++// local includes
++#include "VirtualHidInputDevice.h"
++
++namespace proto = lvh::haiku_protocol;
++
++namespace {
++  constexpr char KEYBOARD_NAME[] = "libvirtualhid Keyboard";
++  constexpr char POINTER_NAME[] = "libvirtualhid Pointer";
++
++  /** Largest valid port message: one event plus the longest text payload. */
++  constexpr size_t MAX_MESSAGE_SIZE = sizeof(proto::event_t) + proto::MAX_TEXT_BYTES;
++
++  /** How often the idle reader wakes up to notice settings changes and shutdown. */
++  constexpr bigtime_t READ_TIMEOUT = 250000;
++
++  /** Settings that could not be read are retried at most this often. */
++  constexpr bigtime_t SETTINGS_RETRY_INTERVAL = 1000000;
++
++  /**
++   * After this much keyboard inactivity every event we enqueued has long been processed, so the
++   * global lock key state input_server reports can be trusted to include local keyboards.
++   */
++  constexpr bigtime_t LOCK_SYNC_IDLE = 1000000;
++
++  /**
++   * Lock key state is re-read while idle at most this often, and only while a client has typed
++   * recently, so an unused add-on never talks to input_server.
++   */
++  constexpr bigtime_t LOCK_SYNC_INTERVAL = 1000000;
++  constexpr bigtime_t LOCK_SYNC_ACTIVE_WINDOW = 10 * 60 * 1000000LL;
++
++  /**
++   * Minimum spacing between pointer events. input_server converts relative motion against the
++   * cursor position it had when it picked up the whole batch of queued events, so pointer events
++   * that arrive together would be applied to a stale position. Haiku's mouse driver reports at
++   * most every 8 ms; 1 ms keeps events apart without adding noticeable latency.
++   */
++  constexpr bigtime_t POINTER_SPACING = 1000;
++
++  /** Queued relative motion is merged for at most this long before it is delivered. */
++  constexpr bigtime_t MOTION_COALESCE_LIMIT = 8000;
++
++  /** Joining the reader from Stop()/Start() waits at most this long (see _StopReader()). */
++  constexpr bigtime_t READER_JOIN_TIMEOUT = 1000000;
++
++  /** Same table selection mask as BKeymap::Offset(). */
++  constexpr uint32 MODIFIER_TABLE_KEYS = B_SHIFT_KEY | B_CAPS_LOCK | B_CONTROL_KEY | B_OPTION_KEY | B_COMMAND_KEY | B_MENU_KEY;
++
++  constexpr uint32 LOCK_MODIFIERS = B_CAPS_LOCK | B_NUM_LOCK | B_SCROLL_LOCK;
++
++  /** Default double-click interval used until input_server reports the user's setting. */
++  constexpr bigtime_t DEFAULT_CLICK_SPEED = 500000;
++
++  /** Dead key numbers, as kDeadKey* in Haiku's Keymap.h. */
++  constexpr uint8 DEAD_KEY_COUNT = 5;
++
++  /**
++   * @brief Return the length of the UTF-8 sequence starting with byte `lead`.
++   */
++  int32 utf8_length(uint8 lead) {
++    if (lead < 0x80) {
++      return 1;
++    }
++    if ((lead & 0xe0) == 0xc0) {
++      return 2;
++    }
++    if ((lead & 0xf0) == 0xe0) {
++      return 3;
++    }
++    if ((lead & 0xf8) == 0xf0) {
++      return 4;
++    }
++    return 0;  // continuation byte or invalid lead byte
++  }
++
++  int32 clamp_to_int32(int64 value) {
++    if (value > INT32_MAX) {
++      return INT32_MAX;
++    }
++    if (value < INT32_MIN) {
++      return INT32_MIN;
++    }
++    return static_cast<int32>(value);
++  }
++
++  float clamp_unit(float value) {
++    if (!std::isfinite(value)) {
++      return 0.0f;
++    }
++    return value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
++  }
++}  // namespace
++
++extern "C" BInputServerDevice *instantiate_input_device() {
++  return new (std::nothrow) VirtualHidInputDevice();
++}
++
++VirtualHidInputDevice::VirtualHidInputDevice():
++    fLock("virtualhid input device"),
++    fKeyboardActive(false),
++    fPointerActive(false),
++    fPort(-1),
++    fReaderThread(-1),
++    fReaderPort(-1),
++    fQuitting(false),
++    fKeymapDirty(true),
++    fLocksDirty(false),
++    fClickSpeedDirty(true),
++    fReleaseKeysPending(false),
++    fReleaseButtonsPending(false),
++    fNextSettingsRetry(0),
++    fLastKeyEvent(0),
++    fLastLockSync(0),
++    fKeys(nullptr),
++    fChars(nullptr),
++    fModifiers(0),
++    fActiveDeadKey(0),
++    fLastKey(0),
++    fRepeatCount(0),
++    fButtons(0),
++    fLastClickButton(0),
++    fLastClickTime(0),
++    fClicks(0),
++    fClickSpeed(DEFAULT_CLICK_SPEED),
++    fPendingDx(0),
++    fPendingDy(0),
++    fHasPendingMotion(false),
++    fPendingSince(0),
++    fLastPositionAbsolute(false),
++    fLastAbsoluteX(0.0f),
++    fLastAbsoluteY(0.0f),
++    fLastPointerEvent(0) {
++  memset(fStates, 0, sizeof(fStates));
++
++  fKeyboardRef.name = const_cast<char *>(KEYBOARD_NAME);
++  fKeyboardRef.type = B_KEYBOARD_DEVICE;
++  fKeyboardRef.cookie = &fKeyboardRef;
++
++  fPointerRef.name = const_cast<char *>(POINTER_NAME);
++  fPointerRef.type = B_POINTING_DEVICE;
++  fPointerRef.cookie = &fPointerRef;
++
++  fDeviceList[0] = &fKeyboardRef;
++  fDeviceList[1] = &fPointerRef;
++  fDeviceList[2] = nullptr;
++}
++
++VirtualHidInputDevice::~VirtualHidInputDevice() {
++  // The reader uses this object, so it must be gone before the object is: wait without limit.
++  // (If it is inside a settings request to input_server's main thread while that thread deletes
++  // us, the request's own 5 second reply timeout ends the wait.)
++  _StopReader(-1);
++  free(fKeys);
++  free(fChars);
++}
++
++status_t VirtualHidInputDevice::InitCheck() {
++  return RegisterDevices(fDeviceList);
++}
++
++status_t VirtualHidInputDevice::SystemShuttingDown() {
++  _StopReader(READER_JOIN_TIMEOUT);
++  return B_OK;
++}
++
++status_t VirtualHidInputDevice::Start(const char * /*device*/, void *cookie) {
++  {
++    BAutolock lock(fLock);
++    if (cookie == &fKeyboardRef) {
++      fKeyboardActive = true;
++    } else if (cookie == &fPointerRef) {
++      fPointerActive = true;
++    } else {
++      return B_BAD_VALUE;
++    }
++  }
++
++  return _StartReader();
++}
++
++status_t VirtualHidInputDevice::Stop(const char * /*device*/, void *cookie) {
++  bool stopReader;
++  {
++    BAutolock lock(fLock);
++    if (cookie == &fKeyboardRef) {
++      fKeyboardActive = false;
++    } else if (cookie == &fPointerRef) {
++      fPointerActive = false;
++    } else {
++      return B_BAD_VALUE;
++    }
++    stopReader = !fKeyboardActive && !fPointerActive;
++    // The reader releases whatever the stopped device still holds (it owns that state).
++    if (cookie == &fKeyboardRef) {
++      fReleaseKeysPending = true;
++    } else {
++      fReleaseButtonsPending = true;
++    }
++  }
++
++  if (stopReader) {
++    _StopReader(READER_JOIN_TIMEOUT);
++  }
++  return B_OK;
++}
++
++status_t VirtualHidInputDevice::Control(const char * /*device*/, void * /*cookie*/, uint32 code, BMessage * /*message*/) {
++  // Control() runs on input_server's own thread. Asking input_server for the keymap from here
++  // would wait on ourselves, so just flag the change for the reader thread.
++  switch (code) {
++    case B_KEY_MAP_CHANGED:
++      fKeymapDirty = true;
++      break;
++    case B_KEY_LOCKS_CHANGED:
++      fLocksDirty = true;
++      break;
++    case B_CLICK_SPEED_CHANGED:
++      fClickSpeedDirty = true;
++      break;
++    default:
++      break;
++  }
++  return B_OK;
++}
++
++status_t VirtualHidInputDevice::_StartReader() {
++  {
++    BAutolock lock(fLock);
++    if (fPort >= 0) {
++      return B_OK;  // already running
++    }
++  }
++
++  // A reader from an earlier Stop() may still be exiting; it must be gone before a new one
++  // starts, or two threads would share the device state.
++  if (!_StopReader(READER_JOIN_TIMEOUT)) {
++    return B_BUSY;
++  }
++
++  BAutolock lock(fLock);
++  if (fPort >= 0) {
++    return B_OK;
++  }
++
++  // Ports die with the team that created them, so a leftover port with our name can only come
++  // from an earlier instance of this add-on inside the same input_server. Remove it so the library
++  // never writes to a port nobody reads.
++  port_id stale = find_port(proto::PORT_NAME);
++  if (stale >= 0) {
++    port_info info;
++    thread_info self;
++    if (get_port_info(stale, &info) == B_OK && get_thread_info(find_thread(nullptr), &self) == B_OK && info.team == self.team) {
++      delete_port(stale);
++    }
++  }
++
++  port_id port = create_port(proto::PORT_CAPACITY, proto::PORT_NAME);
++  if (port < 0) {
++    return port;
++  }
++
++  fQuitting = false;
++  fReaderPort = port;
++  thread_id thread = spawn_thread(&VirtualHidInputDevice::_ReaderThreadEntry, "virtualhid input reader", B_URGENT_DISPLAY_PRIORITY, this);
++  if (thread < 0) {
++    delete_port(port);
++    fReaderPort = -1;
++    return thread;
++  }
++
++  fPort = port;
++  fReaderThread = thread;
++  resume_thread(thread);
++  return B_OK;
++}
++
++bool VirtualHidInputDevice::_StopReader(bigtime_t timeout) {
++  thread_id thread;
++  {
++    BAutolock lock(fLock);
++    thread = fReaderThread;
++    if (thread < 0) {
++      return true;
++    }
++    fQuitting = true;
++    if (fPort >= 0) {
++      // Deleting the port wakes the reader immediately with B_BAD_PORT_ID.
++      delete_port(fPort);
++      fPort = -1;
++    }
++  }
++
++  // The reader occasionally asks input_server for settings. When input_server quits, Stop() runs
++  // on the main thread that answers those requests, so a bounded wait lets such a request time
++  // out instead of blocking quitting; the reader then exits on its own and is joined later.
++  // A negative timeout waits without limit.
++  status_t exitValue;
++  status_t status = timeout < 0 ? wait_for_thread(thread, &exitValue) : wait_for_thread_etc(thread, B_RELATIVE_TIMEOUT, timeout, &exitValue);
++  if (status != B_OK && status != B_BAD_THREAD_ID) {
++    return false;
++  }
++
++  BAutolock lock(fLock);
++  if (fReaderThread == thread) {
++    fReaderThread = -1;
++  }
++  return true;
++}
++
++int32 VirtualHidInputDevice::_ReaderThreadEntry(void *data) {
++  static_cast<VirtualHidInputDevice *>(data)->_ReaderLoop();
++  return 0;
++}
++
++void VirtualHidInputDevice::_ReaderLoop() {
++  // fReaderPort was set before this thread was resumed and does not change while it runs.
++  const port_id port = fReaderPort;
++
++  // One extra byte so a TEXT payload of the maximum size can be terminated in place.
++  char *buffer = static_cast<char *>(malloc(MAX_MESSAGE_SIZE + 1));
++  if (buffer == nullptr) {
++    return;
++  }
++
++  // Start from the current lock key state.
++  _SyncLockState();
++
++  while (!fQuitting) {
++    _RefreshSettings();
++
++    if (fReleaseKeysPending) {
++      fReleaseKeysPending = false;
++      _ReleaseKeys();
++    }
++    if (fReleaseButtonsPending) {
++      fReleaseButtonsPending = false;
++      _DiscardRelative();
++      _ReleaseButtons();
++    }
++
++    // With motion waiting, only look for more events that are already queued.
++    const bigtime_t timeout = fHasPendingMotion ? 0 : READ_TIMEOUT;
++    ssize_t size = port_buffer_size_etc(port, B_RELATIVE_TIMEOUT, timeout);
++    if (size == B_TIMED_OUT || size == B_WOULD_BLOCK) {
++      if (fHasPendingMotion) {
++        _FlushRelative();
++      } else {
++        _IdleTasks();
++      }
++      continue;
++    }
++    if (size == B_INTERRUPTED) {
++      continue;
++    }
++    if (size < 0) {
++      break;  // port deleted: the add-on is stopping
++    }
++
++    int32 code = 0;
++    if (static_cast<size_t>(size) > MAX_MESSAGE_SIZE) {
++      // Discard the oversized message: reading it into a zero-sized buffer drops it.
++      read_port_etc(port, &code, nullptr, 0, B_RELATIVE_TIMEOUT, 0);
++      continue;
++    }
++
++    ssize_t bytesRead = read_port_etc(port, &code, buffer, MAX_MESSAGE_SIZE, B_RELATIVE_TIMEOUT, 0);
++    if (bytesRead < 0) {
++      if (bytesRead == B_TIMED_OUT || bytesRead == B_INTERRUPTED || bytesRead == B_WOULD_BLOCK) {
++        continue;
++      }
++      break;
++    }
++
++    if (code != proto::PROTOCOL_V1 || static_cast<size_t>(bytesRead) < sizeof(proto::event_t)) {
++      continue;  // unknown protocol version or truncated message
++    }
++
++    proto::event_t event;
++    memcpy(&event, buffer, sizeof(event));
++    const size_t payloadSize = static_cast<size_t>(bytesRead) - sizeof(event);
++
++    if (event.type == proto::MOVE_RELATIVE && payloadSize == 0) {
++      bool pointerActive;
++      {
++        BAutolock lock(fLock);
++        pointerActive = fPointerActive;
++      }
++      if (!pointerActive) {
++        continue;  // input_server stopped the virtual pointer
++      }
++
++      // Merge back-to-back relative motion into one event (see POINTER_SPACING).
++      _QueueRelative(event.a, event.b);
++      if (system_time() - fPendingSince >= MOTION_COALESCE_LIMIT) {
++        _FlushRelative();
++      }
++      continue;
++    }
++
++    // Anything else is ordered after the motion that preceded it. A button event carries pending
++    // motion itself, as a mouse driver's button reports do: input_server resolves every event
++    // of a batch against the same old cursor position, so a separate move followed by a click
++    // could put the click (and the cursor) back where the motion started.
++    if (event.type != proto::BUTTON) {
++      _FlushRelative();
++    }
++    _HandleEvent(event, buffer + sizeof(event), payloadSize);
++  }
++
++  // Never leave keys or buttons held when the add-on stops.
++  _FlushRelative();
++  _ReleaseKeys();
++  _ReleaseButtons();
++  free(buffer);
++}
++
++void VirtualHidInputDevice::_HandleEvent(const proto::event_t &event, const char *payload, size_t payloadSize) {
++  // Events without a payload must not carry one; a mismatch means a malformed message.
++  if (event.type != proto::TEXT && payloadSize != 0) {
++    return;
++  }
++
++  bool keyboardActive;
++  bool pointerActive;
++  {
++    BAutolock lock(fLock);
++    keyboardActive = fKeyboardActive;
++    pointerActive = fPointerActive;
++  }
++
++  switch (event.type) {
++    case proto::KEY:
++    case proto::TEXT:
++    case proto::RESET_KEYS:
++      if (!keyboardActive) {
++        return;  // input_server stopped the virtual keyboard
++      }
++      break;
++    case proto::RESET_BUTTONS:
++      break;  // releasing is always allowed
++    default:
++      if (!pointerActive) {
++        _DiscardRelative();
++        return;  // input_server stopped the virtual pointer
++      }
++      break;
++  }
++
++  switch (event.type) {
++    case proto::KEY:
++      _Key(static_cast<uint32>(event.a), event.b != 0);
++      break;
++    case proto::TEXT:
++      if (event.a > 0 && static_cast<size_t>(event.a) == payloadSize && payloadSize <= static_cast<size_t>(proto::MAX_TEXT_BYTES)) {
++        _Text(payload, payloadSize);
++      }
++      break;
++    case proto::MOVE_ABSOLUTE:
++      if (std::isfinite(event.x) && std::isfinite(event.y)) {
++        _MoveAbsolute(event.x, event.y);
++      }
++      break;
++    case proto::BUTTON:
++      _Button(static_cast<uint32>(event.a), event.b != 0);
++      break;
++    case proto::WHEEL:
++      if (std::isfinite(event.x) && std::isfinite(event.y)) {
++        _Wheel(event.x, event.y);
++      }
++      break;
++    case proto::RESET_KEYS:
++      _ReleaseKeys();
++      break;
++    case proto::RESET_BUTTONS:
++      _ReleaseButtons();
++      break;
++    default:
++      break;  // newer event type this add-on does not know yet
++  }
++}
++
++void VirtualHidInputDevice::_RefreshSettings() {
++  // Each refresh asks input_server; skip it once a stop has begun so the reader exits promptly.
++  if (fQuitting) {
++    return;
++  }
++
++  const bool retryDue = system_time() >= fNextSettingsRetry;
++  bool failed = false;
++
++  // A dirty flag is cleared before reading, so a change reported during the read is not lost,
++  // and set again when the read fails, so it is retried (at most every SETTINGS_RETRY_INTERVAL).
++  if (fKeymapDirty && retryDue) {
++    fKeymapDirty = false;
++    if (!_RefreshKeymap()) {
++      fKeymapDirty = true;
++      failed = true;
++    }
++  }
++
++  if (fLocksDirty && retryDue && !fQuitting) {
++    // B_KEY_LOCKS_CHANGED: someone set the lock keys explicitly. Like Haiku's keyboard driver,
++    // take the new state from the keymap's lock_settings.
++    fLocksDirty = false;
++    if (_RefreshKeymap()) {
++      fModifiers = (fModifiers & ~LOCK_MODIFIERS) | (fKeys->lock_settings & LOCK_MODIFIERS);
++    } else {
++      fLocksDirty = true;
++      failed = true;
++    }
++  }
++
++  if (fClickSpeedDirty && retryDue && !fQuitting) {
++    fClickSpeedDirty = false;
++    if (!_RefreshClickSpeed()) {
++      fClickSpeedDirty = true;
++      failed = true;
++    }
++  }
++
++  if (failed) {
++    fNextSettingsRetry = system_time() + SETTINGS_RETRY_INTERVAL;
++  }
++}
++
++bool VirtualHidInputDevice::_RefreshKeymap() {
++  key_map *keys = nullptr;
++  char *chars = nullptr;
++  get_key_map(&keys, &chars);
++  if (keys == nullptr || chars == nullptr) {
++    free(keys);
++    free(chars);
++    return false;  // keep the previous keymap
++  }
++
++  free(fKeys);
++  free(fChars);
++  fKeys = keys;
++  fChars = chars;
++  return true;
++}
++
++void VirtualHidInputDevice::_IdleTasks() {
++  // Lock keys are global: when the local keyboard toggles Caps Lock, typed letters must follow.
++  // Synchronize only while idle (never in the key path, which must not wait on input_server),
++  // after LOCK_SYNC_IDLE without our own key events so input_server's state already includes
++  // everything this device sent, and only while a client has typed recently.
++  const bigtime_t now = system_time();
++  if (fLastKeyEvent != 0 && now - fLastKeyEvent >= LOCK_SYNC_IDLE && now - fLastKeyEvent < LOCK_SYNC_ACTIVE_WINDOW && now - fLastLockSync >= LOCK_SYNC_INTERVAL) {
++    _SyncLockState();
++  }
++}
++
++void VirtualHidInputDevice::_SyncLockState() {
++  if (fQuitting) {
++    return;
++  }
++  fLastLockSync = system_time();
++  const uint32 current = ::modifiers();
++  fModifiers = (fModifiers & ~LOCK_MODIFIERS) | (current & LOCK_MODIFIERS);
++}
++
++bool VirtualHidInputDevice::_RefreshClickSpeed() {
++  bigtime_t speed;
++  if (get_click_speed(&speed) != B_OK || speed <= 0) {
++    return false;
++  }
++  fClickSpeed = speed;
++  return true;
++}
++
++uint32 VirtualHidInputDevice::_ModifierForKey(uint32 keyCode) const {
++  if (fKeys == nullptr) {
++    return 0;
++  }
++
++  // Same mapping as BKeymap::Modifier().
++  if (keyCode == fKeys->caps_key) {
++    return B_CAPS_LOCK;
++  }
++  if (keyCode == fKeys->num_key) {
++    return B_NUM_LOCK;
++  }
++  if (keyCode == fKeys->scroll_key) {
++    return B_SCROLL_LOCK;
++  }
++  if (keyCode == fKeys->left_shift_key) {
++    return B_LEFT_SHIFT_KEY | B_SHIFT_KEY;
++  }
++  if (keyCode == fKeys->right_shift_key) {
++    return B_RIGHT_SHIFT_KEY | B_SHIFT_KEY;
++  }
++  if (keyCode == fKeys->left_command_key) {
++    return B_LEFT_COMMAND_KEY | B_COMMAND_KEY;
++  }
++  if (keyCode == fKeys->right_command_key) {
++    return B_RIGHT_COMMAND_KEY | B_COMMAND_KEY;
++  }
++  if (keyCode == fKeys->left_control_key) {
++    return B_LEFT_CONTROL_KEY | B_CONTROL_KEY;
++  }
++  if (keyCode == fKeys->right_control_key) {
++    return B_RIGHT_CONTROL_KEY | B_CONTROL_KEY;
++  }
++  if (keyCode == fKeys->left_option_key) {
++    return B_LEFT_OPTION_KEY | B_OPTION_KEY;
++  }
++  if (keyCode == fKeys->right_option_key) {
++    return B_RIGHT_OPTION_KEY | B_OPTION_KEY;
++  }
++  if (keyCode == fKeys->menu_key) {
++    return B_MENU_KEY;
++  }
++  return 0;
++}
++
++int32 VirtualHidInputDevice::_CharOffset(uint32 keyCode, uint32 modifiers, uint32 *table) const {
++  // Same table selection as BKeymap::Offset().
++  if (fKeys == nullptr || keyCode >= 128) {
++    return -1;
++  }
++
++  int32 offset;
++  uint32 selected;
++  switch (modifiers & MODIFIER_TABLE_KEYS) {
++    case B_SHIFT_KEY:
++      offset = fKeys->shift_map[keyCode];
++      selected = B_SHIFT_TABLE;
++      break;
++    case B_CAPS_LOCK:
++      offset = fKeys->caps_map[keyCode];
++      selected = B_CAPS_TABLE;
++      break;
++    case B_CAPS_LOCK | B_SHIFT_KEY:
++      offset = fKeys->caps_shift_map[keyCode];
++      selected = B_CAPS_SHIFT_TABLE;
++      break;
++    case B_OPTION_KEY:
++      offset = fKeys->option_map[keyCode];
++      selected = B_OPTION_TABLE;
++      break;
++    case B_OPTION_KEY | B_SHIFT_KEY:
++      offset = fKeys->option_shift_map[keyCode];
++      selected = B_OPTION_SHIFT_TABLE;
++      break;
++    case B_OPTION_KEY | B_CAPS_LOCK:
++      offset = fKeys->option_caps_map[keyCode];
++      selected = B_OPTION_CAPS_TABLE;
++      break;
++    case B_OPTION_KEY | B_SHIFT_KEY | B_CAPS_LOCK:
++      offset = fKeys->option_caps_shift_map[keyCode];
++      selected = B_OPTION_CAPS_SHIFT_TABLE;
++      break;
++    default:
++      if ((modifiers & B_CONTROL_KEY) != 0) {
++        offset = fKeys->control_map[keyCode];
++        selected = B_CONTROL_TABLE;
++      } else {
++        offset = fKeys->normal_map[keyCode];
++        selected = B_NORMAL_TABLE;
++      }
++      break;
++  }
++
++  if (table != nullptr) {
++    *table = selected;
++  }
++  return offset;
++}
++
++uint8 VirtualHidInputDevice::_ActiveDeadKey(uint32 keyCode, uint32 modifiers) const {
++  // BKeymap::ActiveDeadKey(): DeadKey() + DeadKeyIndex(), and the dead key must be enabled for
++  // the modifier table in use.
++  if (fKeys == nullptr || fChars == nullptr) {
++    return 0;
++  }
++
++  uint32 table = 0;
++  const int32 offset = _CharOffset(keyCode, modifiers, &table);
++  if (offset <= 0) {
++    return 0;
++  }
++
++  const uint32 numBytes = static_cast<uint8>(fChars[offset]);
++  if (numBytes == 0 || numBytes > 4) {
++    return 0;
++  }
++
++  const int32 deadOffsets[DEAD_KEY_COUNT] = {
++    fKeys->acute_dead_key[1],
++    fKeys->grave_dead_key[1],
++    fKeys->circumflex_dead_key[1],
++    fKeys->dieresis_dead_key[1],
++    fKeys->tilde_dead_key[1],
++  };
++  const uint32 deadTables[DEAD_KEY_COUNT] = {
++    fKeys->acute_tables,
++    fKeys->grave_tables,
++    fKeys->circumflex_tables,
++    fKeys->dieresis_tables,
++    fKeys->tilde_tables,
++  };
++
++  for (uint8 i = 0; i < DEAD_KEY_COUNT; i++) {
++    bool matches = offset == deadOffsets[i];
++    if (!matches) {
++      const uint32 deadNumBytes = static_cast<uint8>(fChars[deadOffsets[i]]);
++      matches = deadNumBytes != 0 && strncmp(&fChars[offset + 1], &fChars[deadOffsets[i] + 1], deadNumBytes) == 0;
++    }
++    if (matches) {
++      return (deadTables[i] & table) != 0 ? i + 1 : 0;
++    }
++  }
++  return 0;
++}
++
++bool VirtualHidInputDevice::_GetChars(uint32 keyCode, uint32 modifiers, uint8 activeDeadKey, char *out, int32 outSize, int32 *outLength) const {
++  // Same lookup as BKeymap::GetChars().
++  *outLength = 0;
++  if (fKeys == nullptr || fChars == nullptr || outSize < 2) {
++    return false;
++  }
++
++  // Num Lock flips Shift for the keypad.
++  if ((modifiers & B_NUM_LOCK) != 0) {
++    switch (keyCode) {
++      case 0x37:
++      case 0x38:
++      case 0x39:
++      case 0x48:
++      case 0x49:
++      case 0x4a:
++      case 0x58:
++      case 0x59:
++      case 0x5a:
++      case 0x64:
++      case 0x65:
++        modifiers ^= B_SHIFT_KEY;
++        break;
++      default:
++        break;
++    }
++  }
++
++  int32 offset = _CharOffset(keyCode, modifiers, nullptr);
++  if (offset < 0) {
++    return false;
++  }
++
++  int32 length = static_cast<uint8>(fChars[offset]);
++  if (length <= 0 && (modifiers & B_OPTION_KEY) != 0) {
++    // Keys not mapped in an Option table fall back to the plain table.
++    offset = _CharOffset(keyCode, modifiers & ~B_OPTION_KEY, nullptr);
++    if (offset < 0) {
++      return false;
++    }
++    length = static_cast<uint8>(fChars[offset]);
++  }
++  if (length <= 0) {
++    return false;
++  }
++
++  const char *source = &fChars[offset + 1];
++
++  if (activeDeadKey >= 1 && activeDeadKey <= DEAD_KEY_COUNT) {
++    const int32 *deadKeys[DEAD_KEY_COUNT] = {
++      fKeys->acute_dead_key,
++      fKeys->grave_dead_key,
++      fKeys->circumflex_dead_key,
++      fKeys->dieresis_dead_key,
++      fKeys->tilde_dead_key,
++    };
++    const int32 *deadKey = deadKeys[activeDeadKey - 1];
++
++    // The dead key table holds (base, composed) offset pairs.
++    for (int32 i = 0; i < 32; i += 2) {
++      if (strncmp(source, &fChars[deadKey[i] + 1], length) == 0) {
++        length = static_cast<uint8>(fChars[deadKey[i + 1]]);
++        if (length <= 0) {
++          return false;  // combination not mapped
++        }
++        source = &fChars[deadKey[i + 1] + 1];
++        break;
++      }
++    }
++  }
++
++  if (length >= outSize) {
++    return false;
++  }
++  memcpy(out, source, length);
++  out[length] = '\0';
++  *outLength = length;
++  return true;
++}
++
++bool VirtualHidInputDevice::_IsKeyDown(uint32 keyCode) const {
++  if (keyCode >= 128) {
++    return false;
++  }
++  return (fStates[keyCode >> 3] & (1 << (7 - (keyCode & 0x7)))) != 0;
++}
++
++void VirtualHidInputDevice::_SetKeyState(uint32 keyCode, bool down) {
++  if (keyCode >= 128) {
++    return;
++  }
++  if (down) {
++    fStates[keyCode >> 3] |= (1 << (7 - (keyCode & 0x7)));
++  } else {
++    fStates[keyCode >> 3] &= ~(1 << (7 - (keyCode & 0x7)));
++  }
++}
++
++void VirtualHidInputDevice::_Enqueue(BMessage *message) {
++  if (message != nullptr && EnqueueMessage(message) != B_OK) {
++    delete message;
++  }
++}
++
++void VirtualHidInputDevice::_EnqueuePointer(BMessage *message) {
++  if (message == nullptr) {
++    return;
++  }
++
++  // Keep pointer events apart so input_server applies each one to the current cursor position.
++  const bigtime_t earliest = fLastPointerEvent + POINTER_SPACING;
++  if (system_time() < earliest) {
++    snooze_until(earliest, B_SYSTEM_TIMEBASE);
++  }
++  fLastPointerEvent = system_time();
++
++  message->AddInt64("when", fLastPointerEvent);
++  message->AddInt32("be:device_subtype", B_MOUSE_POINTING_DEVICE);
++  _Enqueue(message);
++}
++
++void VirtualHidInputDevice::_AddPointerPosition(BMessage *message) const {
++  // Every pointer event must carry a position, otherwise input_server moves the cursor to 0,0.
++  if (fLastPositionAbsolute) {
++    // An absolute client positions the cursor itself; repeat its last position so the event
++    // lands exactly where the client put it.
++    message->AddFloat("x", fLastAbsoluteX);
++    message->AddFloat("y", fLastAbsoluteY);
++  } else {
++    // A zero relative motion keeps the cursor where it is.
++    message->AddInt32("x", 0);
++    message->AddInt32("y", 0);
++  }
++}
++
++void VirtualHidInputDevice::_Key(uint32 keyCode, bool down) {
++  if (keyCode == 0 || keyCode >= 128) {
++    return;
++  }
++
++  const bool wasDown = _IsKeyDown(keyCode);
++  if (!down && !wasDown) {
++    return;  // release for a key we never pressed
++  }
++
++  const bigtime_t now = system_time();
++  fLastKeyEvent = now;
++
++  _SetKeyState(keyCode, down);
++
++  // Modifier bookkeeping, identical to KeyboardInputDevice.
++  const uint32 modifier = _ModifierForKey(keyCode);
++  const bool isLock = (modifier & LOCK_MODIFIERS) != 0;
++  if (modifier != 0 && (!isLock || down) && !(isLock && wasDown)) {
++    const uint32 oldModifiers = fModifiers;
++
++    if ((down && !isLock) || (down && !(fModifiers & modifier))) {
++      fModifiers |= modifier;
++    } else {
++      fModifiers &= ~modifier;
++
++      // Keep a combined B_*_KEY while its other side is still held.
++      if (fModifiers & (B_LEFT_SHIFT_KEY | B_RIGHT_SHIFT_KEY)) {
++        fModifiers |= B_SHIFT_KEY;
++      }
++      if (fModifiers & (B_LEFT_COMMAND_KEY | B_RIGHT_COMMAND_KEY)) {
++        fModifiers |= B_COMMAND_KEY;
++      }
++      if (fModifiers & (B_LEFT_CONTROL_KEY | B_RIGHT_CONTROL_KEY)) {
++        fModifiers |= B_CONTROL_KEY;
++      }
++      if (fModifiers & (B_LEFT_OPTION_KEY | B_RIGHT_OPTION_KEY)) {
++        fModifiers |= B_OPTION_KEY;
++      }
++    }
++
++    if (fModifiers != oldModifiers) {
++      BMessage *changed = new (std::nothrow) BMessage(B_MODIFIERS_CHANGED);
++      if (changed != nullptr) {
++        changed->AddInt64("when", now);
++        changed->AddInt32("be:old_modifiers", oldModifiers);
++        changed->AddInt32("modifiers", fModifiers);
++        changed->AddData("states", B_UINT8_TYPE, fStates, sizeof(fStates));
++        _Enqueue(changed);
++      }
++    }
++  }
++
++  // Dead keys, as in KeyboardInputDevice: a dead key produces no character itself; the next key
++  // press is composed with it (for example dead acute + e = é). Haiku's driver also shows the
++  // pending accent through an inline input method; this device composes without that preview.
++  uint8 newDeadKey = 0;
++  if (fActiveDeadKey == 0 || !down) {
++    newDeadKey = _ActiveDeadKey(keyCode, fModifiers);
++  }
++
++  char string[16];
++  int32 numBytes = 0;
++  if (newDeadKey == 0) {
++    _GetChars(keyCode, fModifiers, fActiveDeadKey, string, sizeof(string), &numBytes);
++  }
++
++  char rawString[16];
++  int32 rawNumBytes = 0;
++  _GetChars(keyCode, 0, 0, rawString, sizeof(rawString), &rawNumBytes);
++
++  if (newDeadKey == 0) {
++    if (down && modifier == 0 && fActiveDeadKey != 0) {
++      fActiveDeadKey = 0;  // the dead key was completed
++    }
++  } else if (down) {
++    fActiveDeadKey = newDeadKey;  // start of a dead key
++  }
++
++  BMessage *message = new (std::nothrow) BMessage();
++  if (message == nullptr) {
++    return;
++  }
++
++  if (numBytes > 0) {
++    message->what = down ? B_KEY_DOWN : B_KEY_UP;
++  } else {
++    message->what = down ? B_UNMAPPED_KEY_DOWN : B_UNMAPPED_KEY_UP;
++  }
++
++  message->AddInt64("when", now);
++  message->AddInt32("key", keyCode);
++  message->AddInt32("modifiers", fModifiers);
++  message->AddData("states", B_UINT8_TYPE, fStates, sizeof(fStates));
++
++  if (numBytes > 0) {
++    for (int32 i = 0; i < numBytes; i++) {
++      message->AddInt8("byte", static_cast<int8>(string[i]));
++    }
++    message->AddData("bytes", B_STRING_TYPE, string, numBytes + 1);
++
++    if (down && fLastKey == keyCode) {
++      fRepeatCount++;
++      message->AddInt32("be:key_repeat", fRepeatCount);
++    } else {
++      fRepeatCount = 1;
++    }
++  }
++
++  if (rawNumBytes > 0) {
++    message->AddInt32("raw_char", static_cast<uint32>(static_cast<uint8>(rawString[0]) & 0x7f));
++  } else if (numBytes > 0) {
++    message->AddInt32("raw_char", static_cast<uint32>(static_cast<uint8>(string[0]) & 0x7f));
++  }
++
++  _Enqueue(message);
++  fLastKey = down ? keyCode : 0;
++}
++
++void VirtualHidInputDevice::_Text(const char *text, size_t length) {
++  // Deliver each UTF-8 character as its own key press without a physical key code, the same
++  // way input methods hand finished characters to applications.
++  const auto *cursor = reinterpret_cast<const uint8 *>(text);
++  const auto *end = cursor + length;
++  while (cursor < end) {
++    const int32 charLength = utf8_length(*cursor);
++    if (charLength == 0 || *cursor == 0 || end - cursor < charLength) {
++      cursor++;  // skip invalid, embedded NUL or truncated bytes
++      continue;
++    }
++
++    bool complete = true;
++    for (int32 i = 1; i < charLength; i++) {
++      if ((cursor[i] & 0xc0) != 0x80) {
++        complete = false;
++        break;
++      }
++    }
++    if (!complete) {
++      cursor++;
++      continue;
++    }
++
++    char character[5];
++    memcpy(character, cursor, charLength);
++    character[charLength] = '\0';
++    cursor += charLength;
++
++    for (bool down : {true, false}) {
++      BMessage *message = new (std::nothrow) BMessage(down ? B_KEY_DOWN : B_KEY_UP);
++      if (message == nullptr) {
++        return;
++      }
++      message->AddInt64("when", system_time());
++      message->AddInt32("key", 0);
++      message->AddInt32("modifiers", fModifiers);
++      message->AddData("states", B_UINT8_TYPE, fStates, sizeof(fStates));
++      for (int32 i = 0; i < charLength; i++) {
++        message->AddInt8("byte", static_cast<int8>(character[i]));
++      }
++      message->AddData("bytes", B_STRING_TYPE, character, charLength + 1);
++      message->AddInt32("raw_char", charLength == 1 ? static_cast<uint8>(character[0]) & 0x7f : 0);
++      _Enqueue(message);
++    }
++  }
++}
++
++void VirtualHidInputDevice::_QueueRelative(int32 dx, int32 dy) {
++  if (dx == 0 && dy == 0) {
++    return;
++  }
++  if (!fHasPendingMotion) {
++    fHasPendingMotion = true;
++    fPendingSince = system_time();
++    fPendingDx = 0;
++    fPendingDy = 0;
++  }
++  fPendingDx += dx;
++  fPendingDy += dy;
++  fLastPositionAbsolute = false;
++}
++
++void VirtualHidInputDevice::_DiscardRelative() {
++  fHasPendingMotion = false;
++  fPendingDx = 0;
++  fPendingDy = 0;
++}
++
++void VirtualHidInputDevice::_FlushRelative() {
++  if (!fHasPendingMotion) {
++    return;
++  }
++  fHasPendingMotion = false;
++
++  const int32 dx = clamp_to_int32(fPendingDx);
++  const int32 dy = clamp_to_int32(fPendingDy);
++  if (dx == 0 && dy == 0) {
++    return;
++  }
++
++  BMessage *message = new (std::nothrow) BMessage(B_MOUSE_MOVED);
++  if (message == nullptr) {
++    return;
++  }
++  // input_server treats int32 x/y as relative motion with y pointing up, like a mouse driver.
++  message->AddInt32("buttons", fButtons);
++  message->AddInt32("x", dx);
++  message->AddInt32("y", dy == INT32_MIN ? INT32_MAX : -dy);
++  _EnqueuePointer(message);
++}
++
++void VirtualHidInputDevice::_MoveAbsolute(float x, float y) {
++  fLastPositionAbsolute = true;
++  fLastAbsoluteX = clamp_unit(x);
++  fLastAbsoluteY = clamp_unit(y);
++
++  BMessage *message = new (std::nothrow) BMessage(B_MOUSE_MOVED);
++  if (message == nullptr) {
++    return;
++  }
++  // input_server treats float x/y as absolute screen coordinates in the 0..1 range.
++  message->AddInt32("buttons", fButtons);
++  message->AddFloat("x", fLastAbsoluteX);
++  message->AddFloat("y", fLastAbsoluteY);
++  _EnqueuePointer(message);
++}
++
++void VirtualHidInputDevice::_Button(uint32 button, bool down) {
++  // Exactly one button bit.
++  if (button == 0 || (button & (button - 1)) != 0) {
++    return;
++  }
++
++  const uint32 newButtons = down ? (fButtons | button) : (fButtons & ~button);
++  if (newButtons == fButtons) {
++    return;
++  }
++  fButtons = newButtons;
++
++  BMessage *message = new (std::nothrow) BMessage(down ? B_MOUSE_DOWN : B_MOUSE_UP);
++  if (message == nullptr) {
++    return;
++  }
++
++  message->AddInt32("buttons", fButtons);
++  if (fHasPendingMotion) {
++    // Deliver the queued relative motion with the button event itself.
++    fHasPendingMotion = false;
++    const int32 dx = clamp_to_int32(fPendingDx);
++    const int32 dy = clamp_to_int32(fPendingDy);
++    message->AddInt32("x", dx);
++    message->AddInt32("y", dy == INT32_MIN ? INT32_MAX : -dy);
++  } else {
++    _AddPointerPosition(message);
++  }
++
++  if (down) {
++    const bigtime_t now = system_time();
++    if (button == fLastClickButton && now - fLastClickTime <= fClickSpeed) {
++      fClicks++;
++    } else {
++      fClicks = 1;
++    }
++    fLastClickButton = button;
++    fLastClickTime = now;
++    message->AddInt32("clicks", fClicks);
++  }
++
++  _EnqueuePointer(message);
++}
++
++void VirtualHidInputDevice::_Wheel(float dx, float dy) {
++  if (dx == 0.0f && dy == 0.0f) {
++    return;
++  }
++
++  BMessage *message = new (std::nothrow) BMessage(B_MOUSE_WHEEL_CHANGED);
++  if (message == nullptr) {
++    return;
++  }
++  message->AddFloat("be:wheel_delta_x", dx);
++  message->AddFloat("be:wheel_delta_y", dy);
++  _EnqueuePointer(message);
++}
++
++void VirtualHidInputDevice::_ReleaseKeys() {
++  for (uint32 keyCode = 1; keyCode < 128; keyCode++) {
++    if (_IsKeyDown(keyCode)) {
++      // Lock keys toggle on press only; releasing them does not flip their state again.
++      _Key(keyCode, false);
++    }
++  }
++  fActiveDeadKey = 0;
++}
++
++void VirtualHidInputDevice::_ReleaseButtons() {
++  for (uint32 bit = 0; bit < 32; bit++) {
++    const uint32 button = 1u << bit;
++    if ((fButtons & button) != 0) {
++      _Button(button, false);
++    }
++  }
++}
+diff --git a/src/platform/haiku/input_server/VirtualHidInputDevice.h b/src/platform/haiku/input_server/VirtualHidInputDevice.h
+new file mode 100644
+index 0000000..11c01fc
+--- /dev/null
++++ b/src/platform/haiku/input_server/VirtualHidInputDevice.h
+@@ -0,0 +1,119 @@
++/**
++ * @file src/platform/haiku/input_server/VirtualHidInputDevice.h
++ * @brief input_server device add-on that injects libvirtualhid keyboard and mouse input into Haiku.
++ *
++ * Installed to `<prefix>/add-ons/input_server/devices/virtualhid_input`, for example
++ * `~/config/non-packaged/add-ons/input_server/devices/virtualhid_input`.
++ * The add-on registers a virtual keyboard and a virtual pointer, listens on the port named in
++ * haiku_input_protocol.hpp and converts the backend's events into the same messages Haiku's own
++ * keyboard and mouse add-ons produce, so every application sees ordinary input.
++ */
++#pragma once
++
++// platform includes
++#include <InputServerDevice.h>
++#include <InterfaceDefs.h>
++#include <Locker.h>
++#include <OS.h>
++
++// local includes
++#include "haiku_input_protocol.hpp"
++
++class BMessage;
++
++/**
++ * @brief Virtual keyboard and pointer fed by the libvirtualhid Haiku backend over a kernel port.
++ */
++class VirtualHidInputDevice: public BInputServerDevice {
++public:
++  VirtualHidInputDevice();
++  ~VirtualHidInputDevice() override;
++
++  status_t InitCheck() override;
++  status_t SystemShuttingDown() override;
++  status_t Start(const char *device, void *cookie) override;
++  status_t Stop(const char *device, void *cookie) override;
++  status_t Control(const char *device, void *cookie, uint32 code, BMessage *message) override;
++
++private:
++  static int32 _ReaderThreadEntry(void *data);
++  void _ReaderLoop();
++  status_t _StartReader();
++  bool _StopReader(bigtime_t timeout);
++
++  void _HandleEvent(const lvh::haiku_protocol::event_t &event, const char *payload, size_t payloadSize);
++  void _RefreshSettings();
++  bool _RefreshKeymap();
++  void _IdleTasks();
++  void _SyncLockState();
++  bool _RefreshClickSpeed();
++
++  void _Key(uint32 keyCode, bool down);
++  void _Text(const char *text, size_t length);
++  void _QueueRelative(int32 dx, int32 dy);
++  void _FlushRelative();
++  void _DiscardRelative();
++  void _MoveAbsolute(float x, float y);
++  void _Button(uint32 button, bool down);
++  void _Wheel(float dx, float dy);
++  void _ReleaseKeys();
++  void _ReleaseButtons();
++
++  uint32 _ModifierForKey(uint32 keyCode) const;
++  int32 _CharOffset(uint32 keyCode, uint32 modifiers, uint32 *table) const;
++  uint8 _ActiveDeadKey(uint32 keyCode, uint32 modifiers) const;
++  bool _GetChars(uint32 keyCode, uint32 modifiers, uint8 activeDeadKey, char *out, int32 outSize, int32 *outLength) const;
++  bool _IsKeyDown(uint32 keyCode) const;
++  void _SetKeyState(uint32 keyCode, bool down);
++  void _Enqueue(BMessage *message);
++  void _EnqueuePointer(BMessage *message);
++  void _AddPointerPosition(BMessage *message) const;
++
++  input_device_ref fKeyboardRef;
++  input_device_ref fPointerRef;
++  input_device_ref *fDeviceList[3];
++
++  BLocker fLock;  ///< Guards the active flags, the port and the reader thread handle.
++  bool fKeyboardActive;
++  bool fPointerActive;
++  port_id fPort;
++  thread_id fReaderThread;  ///< Running or still exiting reader; reset only once joined.
++  port_id fReaderPort;  ///< Port of the current reader, set before the thread starts.
++  volatile bool fQuitting;
++
++  // Set by Control() on input_server's thread, consumed by the reader thread.
++  volatile bool fKeymapDirty;
++  volatile bool fLocksDirty;
++  volatile bool fClickSpeedDirty;
++
++  // Set by Stop() for one device, consumed by the reader thread.
++  volatile bool fReleaseKeysPending;
++  volatile bool fReleaseButtonsPending;
++
++  // State below is only touched by the reader thread.
++  bigtime_t fNextSettingsRetry;
++  bigtime_t fLastKeyEvent;
++  bigtime_t fLastLockSync;
++  key_map *fKeys;
++  char *fChars;
++  uint32 fModifiers;
++  uint8 fStates[16];
++  uint8 fActiveDeadKey;
++  uint32 fLastKey;
++  int32 fRepeatCount;
++
++  uint32 fButtons;
++  uint32 fLastClickButton;
++  bigtime_t fLastClickTime;
++  int32 fClicks;
++  bigtime_t fClickSpeed;
++
++  int64 fPendingDx;
++  int64 fPendingDy;
++  bool fHasPendingMotion;
++  bigtime_t fPendingSince;
++  bool fLastPositionAbsolute;
++  float fLastAbsoluteX;
++  float fLastAbsoluteY;
++  bigtime_t fLastPointerEvent;
++};
+diff --git a/src/platform/haiku/input_server/addon.cmake b/src/platform/haiku/input_server/addon.cmake
+new file mode 100644
+index 0000000..9f75ca8
+--- /dev/null
++++ b/src/platform/haiku/input_server/addon.cmake
+@@ -0,0 +1,45 @@
++# Haiku input_server device add-on used by the Haiku backend.
++#
++# input_server loads every file in <prefix>/add-ons/input_server/devices, so the module has no
++# "lib" prefix and no suffix. Device add-ons resolve BInputServerDevice from the input_server
++# executable itself, so that executable is linked like a library (the same way HaikuPorts builds
++# other third-party input_server add-ons).
++
++find_file(LIBVIRTUALHID_HAIKU_INPUT_SERVER input_server
++  HINTS
++    /boot/system/servers
++    /system/servers
++  NO_DEFAULT_PATH
++  NO_CMAKE_FIND_ROOT_PATH)
++if(NOT LIBVIRTUALHID_HAIKU_INPUT_SERVER)
++    message(FATAL_ERROR
++      "libvirtualhid: couldn't find /boot/system/servers/input_server, which the Haiku input "
++      "add-on links against. Set LIBVIRTUALHID_HAIKU_INPUT_SERVER or turn off "
++      "LIBVIRTUALHID_BUILD_HAIKU_INPUT_ADDON.")
++endif()
++
++add_library(libvirtualhid_haiku_input_addon MODULE
++  "${CMAKE_CURRENT_LIST_DIR}/VirtualHidInputDevice.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/VirtualHidInputDevice.h"
++  "${CMAKE_CURRENT_LIST_DIR}/../haiku_input_protocol.hpp")
++add_library(libvirtualhid::haiku_input_addon ALIAS libvirtualhid_haiku_input_addon)
++set_target_properties(libvirtualhid_haiku_input_addon PROPERTIES
++  PREFIX ""
++  SUFFIX ""
++  OUTPUT_NAME "virtualhid_input")
++target_compile_features(libvirtualhid_haiku_input_addon PRIVATE cxx_std_17)
++target_include_directories(libvirtualhid_haiku_input_addon
++  PRIVATE
++  "${CMAKE_CURRENT_LIST_DIR}/..")
++# Haiku message codes are four-character constants.
++target_compile_options(libvirtualhid_haiku_input_addon PRIVATE -Wall -Wno-multichar)
++target_link_libraries(libvirtualhid_haiku_input_addon
++  PRIVATE
++  be
++  "${LIBVIRTUALHID_HAIKU_INPUT_SERVER}")
++
++if(LIBVIRTUALHID_INSTALL)
++    install(TARGETS libvirtualhid_haiku_input_addon
++      LIBRARY DESTINATION "add-ons/input_server/devices"
++      COMPONENT library)
++endif()
+-- 
+2.43.0
+

@@ -122,6 +122,8 @@ elseif(UNIX)
 
     if(APPLE)
         include("${CMAKE_MODULE_PATH}/dependencies/macos.cmake")
+    elseif(HAIKU)
+        include("${CMAKE_MODULE_PATH}/dependencies/haiku.cmake")
     else()
         include("${CMAKE_MODULE_PATH}/dependencies/linux.cmake")
     endif()

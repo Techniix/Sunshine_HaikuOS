@@ -1293,8 +1293,11 @@ namespace video {
     // RC buffer size will be set in platform code if supported
     LIMITED_GOP_SIZE | PARALLEL_ENCODING | NO_RC_BUF_LIMIT
   };
+#endif  // linux
 
-  #ifdef SUNSHINE_BUILD_VULKAN
+// Vulkan Video encoding is available on Linux and Haiku. On Haiku, frames are
+// captured to system memory and uploaded to the Vulkan device by FFmpeg.
+#ifdef SUNSHINE_BUILD_VULKAN
   encoder_t vulkan {
     "vulkan"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
@@ -1366,8 +1369,7 @@ namespace video {
     },
     LIMITED_GOP_SIZE | PARALLEL_ENCODING
   };
-  #endif  // SUNSHINE_BUILD_VULKAN
-#endif  // linux
+#endif  // SUNSHINE_BUILD_VULKAN
 
 #ifdef __APPLE__
   /**
@@ -1448,7 +1450,8 @@ namespace video {
 #endif
 
   static const std::vector encoders {
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(__HAIKU__)
+    // NVENC needs NVIDIA's proprietary CUDA driver, which does not exist on Haiku.
     &nvenc,
 #endif
 #ifdef _WIN32
@@ -1461,6 +1464,9 @@ namespace video {
     &vulkan,
   #endif
     &vaapi,
+#endif
+#if defined(__HAIKU__) && defined(SUNSHINE_BUILD_VULKAN)
+    &vulkan,
 #endif
 #ifdef __APPLE__
     &videotoolbox,

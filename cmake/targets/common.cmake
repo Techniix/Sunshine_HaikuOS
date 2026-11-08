@@ -18,6 +18,8 @@ elseif(UNIX)
 
     if(APPLE)
         include(${CMAKE_MODULE_PATH}/targets/macos.cmake)
+    elseif(HAIKU)
+        include(${CMAKE_MODULE_PATH}/targets/haiku.cmake)
     else()
         include(${CMAKE_MODULE_PATH}/targets/linux.cmake)
     endif()
